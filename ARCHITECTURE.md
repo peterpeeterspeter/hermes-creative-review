@@ -60,10 +60,12 @@ mock. The plugin uses a documented, first-class SDK door:
 
 ```js
 // desktop/plugin.js
+const target = host.state.focusedSessionId.get() // pin before asynchronous work
+// Require a target in the board backend owner scope; no null/focused fallback.
+await pendingFeedbackWrites
 const brief = await api('/revision', { method: 'POST', body: { board_id, image_id, overall_note } })
-const target = host.state.focusedSessionId.get()          // the focused chat
-const sent = host.composer.submit(target, brief.brief.markdown)  // a real user turn
-if (!sent) await host.composer.setDraft(target, brief.brief.markdown)  // fallback: leave a draft
+const sent = host.composer.submit(target, brief.brief.markdown)
+if (!sent) await host.composer.insertText(target, brief.brief.markdown, { mode: 'block' })
 ```
 
 `host.composer.submit` is the SDK's supported "send as if the user typed and
@@ -89,8 +91,7 @@ POST   /approve
 GET    /export?board_id=&format=
 ```
 
-`GET /image-data` is the only route that touches image bytes: it reads one
-registered file from disk and returns a `data:` URL. Nothing is uploaded.
+`GET /image-data` returns a data URL; `/file` serves raw bytes without an encode/decode round trip. Both read only registered backend-local files with a bounded read and file-signature check. Signature validation is not a complete image decoder; browser decoding failures have an explicit error state.
 
 ## Polling
 
@@ -98,3 +99,11 @@ The pane polls `/boards` and `/board` every 4 s via React Query (the same client
 the app uses). That is how a revision the **agent** registers shows up while the
 user is looking at the board. No socket is used (sockets are a no-op on OAuth
 remotes, so polling is the reliable floor).
+
+Query keys include connection and profile. The review page remounts on scope changes, selection is persisted per scope, and queued edits/responses fail closed when the backend changes. Feedback writes are serialized and awaited before creating a brief. A double-submit lock prevents duplicate requests.
+
+## Integrity and verification
+
+All approval and revision writes validate board/image ownership in the store. Annotation number allocation uses `BEGIN IMMEDIATE` before reading MAX(number), serializing writers across processes. Rejected/unapproved boards export history only; unique export directories prevent overwrites. Image import accepts absolute paths, generated/reference roles, size-limited files and matching format signatures. Existing malformed historical records are not automatically rewritten.
+
+`desktop_harness.mjs` checks declarations only. `desktop_mounted.mjs` mounts the shipped components with real React/ReactDOM, TanStack Query and jsdom; SDK/REST are mocked. It checks zoom, Locate, click coordinates, queued saves, pinned target, backend cancellation, safe draft append, import and duplicate-request suppression. Neither test proves live Electron layout or real Hermes/image-provider delivery. The isolated ASGI test independently exercises real routes/storage/export and cross-process persistence.

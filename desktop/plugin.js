@@ -46,6 +46,15 @@ export const PAGE_PATH = '/creative-review'
 const STYLE_ID = 'creative-review-style'
 const POLL_MS = 4000
 const DBKEY = [ID]
+let storage = null
+function scopeKey() {
+  return JSON.stringify([host.state.connectionId?.get() || 'local', host.state.profile.get() || 'default'])
+}
+function useScope() {
+  useValue(host.state.connectionId)
+  useValue(host.state.profile)
+  return scopeKey()
+}
 // Badge accepts only: default | muted | success | warn | destructive | outline | solid.
 const ROLE_BADGE = { reference: 'muted', generated: 'default', approved: 'success' }
 
@@ -60,9 +69,10 @@ function present(child) {
 }
 function el(type, props, children) {
   const list = (Array.isArray(children) ? children : [children]).filter(present)
-  if (list.length === 0) return jsx(type, props || {})
-  if (list.length === 1) return jsx(type, { ...(props || {}), children: list[0] })
-  return jsxs(type, { ...(props || {}), children: list })
+  const { key, ...clean } = props || {}
+  if (list.length === 0) return jsx(type, clean, key)
+  if (list.length === 1) return jsx(type, { ...clean, children: list[0] }, key)
+  return jsxs(type, { ...clean, children: list }, key)
 }
 function box(className, children, key) {
   return el('div', { className, key }, children)
@@ -74,12 +84,16 @@ function shortId(id) {
   return txt(id).replace(/^[a-z]+_/, '').slice(0, 6)
 }
 function pct(value) {
-  return `${Math.round(Number(value) * 100)}%`
+  return `${Number(value) * 100}%`
 }
 
 async function api(path, options) {
   if (!rest) throw new Error('creative-review: plugin context is not registered')
-  return rest(path, options)
+  const scope = scopeKey()
+  const result = await rest(path, options)
+  if (scope !== scopeKey()) throw new Error("Backend changed during the request; retry in the selected profile")
+  if (result && result.ok === false) throw new Error(result.message || result.error || "Request failed")
+  return result
 }
 
 // ---------------------------------------------------------------------------
@@ -88,48 +102,69 @@ async function api(path, options) {
 function useBoards() {
   const gateway = useValue(host.state.gateway)
   return useQuery({
-    queryKey: [...DBKEY, 'boards'],
+    queryKey: [...DBKEY, useScope(), 'boards'],
     queryFn: () => api('/boards'),
     refetchInterval: POLL_MS,
     enabled: gateway === 'open',
-    placeholderData: (previous) => previous
+    placeholderData: undefined
   })
 }
 
 function useBoard(boardId) {
   const gateway = useValue(host.state.gateway)
   return useQuery({
-    queryKey: [...DBKEY, 'board', boardId || ''],
+    queryKey: [...DBKEY, useScope(), 'board', boardId || ''],
     queryFn: () => api(`/board?board_id=${encodeURIComponent(boardId)}`),
     refetchInterval: boardId ? POLL_MS : false,
     enabled: gateway === 'open' && !!boardId,
-    placeholderData: (previous) => previous
+    placeholderData: undefined
   })
 }
 
 function useImageData(imageId) {
   const q = useQuery({
-    queryKey: [...DBKEY, 'image-data', imageId || ''],
+    queryKey: [...DBKEY, useScope(), 'image-data', imageId || ''],
     queryFn: () => api(`/image-data?image_id=${encodeURIComponent(imageId)}`),
     enabled: !!imageId,
     staleTime: 10 * 60 * 1000,
     gcTime: 30 * 60 * 1000,
     refetchOnWindowFocus: false
   })
-  return q.data && q.data.ok ? q.data.data_url : null
+  return q
 }
 
 // ---------------------------------------------------------------------------
 // The image stage: zoom, pan, click-to-annotate
 // ---------------------------------------------------------------------------
-function ImageStage({ image, allowAnnotate, onAddMarker, fitKey }) {
-  const dataUrl = useImageData(image ? image.id : null)
+function ImageStage({ image, allowAnnotate, onAddMarker, fitKey, locate }) {
+  const imageQuery = useImageData(image ? image.id : null)
+  const dataUrl = imageQuery.data?.data_url
+  const [natural, setNatural] = useState(null)
+  const [decodeError, setDecodeError] = useState(false)
+  const [frameSize, setFrameSize] = useState({ width: 1, height: 1 })
   const [view, setView] = useState({ scale: 1, tx: 0, ty: 0 })
   const containerRef = useRef(null)
+  useEffect(() => { setNatural(null); setDecodeError(false) }, [image?.id])
   const dragRef = useRef({ panning: false, moved: false, sx: 0, sy: 0, ox: 0, oy: 0 })
 
   // Reset the view when the shown image changes.
   useEffect(() => { setView({ scale: 1, tx: 0, ty: 0 }) }, [image ? image.id : null, fitKey])
+
+  useEffect(() => {
+    const node = containerRef.current
+    if (!node) return undefined
+    const measure = () => setFrameSize({ width: node.clientWidth || 1, height: node.clientHeight || 1 })
+    measure()
+    const observer = new ResizeObserver(measure)
+    observer.observe(node)
+    return () => observer.disconnect()
+  }, [image?.id])
+  useEffect(() => {
+    if (!locate || !natural) return
+    const ratio = Math.min(frameSize.width / natural.width, frameSize.height / natural.height, 1)
+    const width = natural.width * ratio, height = natural.height * ratio
+    setView({ scale: 2, tx: frameSize.width / 2 - 2 * ((frameSize.width - width) / 2 + locate.x * width), ty: frameSize.height / 2 - 2 * ((frameSize.height - height) / 2 + locate.y * height) })
+  }, [locate, natural, frameSize])
 
   // Wheel zoom needs a non-passive listener to preventDefault reliably.
   useEffect(() => {
@@ -157,7 +192,7 @@ function ImageStage({ image, allowAnnotate, onAddMarker, fitKey }) {
   }
 
   const onPointerDown = (event) => {
-    const panning = event.button === 1 || (allowAnnotate === false)
+    const panning = event.button === 1 || event.altKey || (allowAnnotate === false)
     dragRef.current = {
       panning,
       moved: false,
@@ -182,6 +217,7 @@ function ImageStage({ image, allowAnnotate, onAddMarker, fitKey }) {
   const onClickImage = (event) => {
     if (!allowAnnotate || dragRef.current.moved) return
     const rect = event.currentTarget.getBoundingClientRect()
+    if (!rect.width || !rect.height || decodeError) return
     const x = (event.clientX - rect.left) / rect.width
     const y = (event.clientY - rect.top) / rect.height
     if (x < 0 || x > 1 || y < 0 || y > 1) return
@@ -189,9 +225,10 @@ function ImageStage({ image, allowAnnotate, onAddMarker, fitKey }) {
   }
 
   const markers = image.annotations || []
+  const fitScale = natural ? Math.min(frameSize.width / natural.width, frameSize.height / natural.height, 1) : 1
+  const painted = natural ? { width: natural.width * fitScale, height: natural.height * fitScale } : {}
 
-  return box(
-    'cr-stage',
+  return el('div', { className: 'cr-stage', ref: containerRef },
     [
       el(
         'div',
@@ -205,16 +242,20 @@ function ImageStage({ image, allowAnnotate, onAddMarker, fitKey }) {
         },
         [
           el('div', { className: 'cr-frame' }, [
-            dataUrl
+            decodeError
+              ? el(ErrorState, { title: "Invalid image", description: "The browser could not decode this file" })
+              : dataUrl
               ? el(
                   'div',
-                  { className: 'cr-canvas' },
+                  { className: 'cr-canvas', style: painted },
                   [
                     el('img', {
                       className: cn('cr-image', allowAnnotate && 'cr-image-annotate'),
                       src: dataUrl,
                       alt: image.label || image.id,
                       draggable: false,
+                      onLoad: (e) => setNatural({ width: e.currentTarget.naturalWidth, height: e.currentTarget.naturalHeight }),
+                      onError: () => setDecodeError(true),
                       onClick: onClickImage
                     }),
                     el(
@@ -241,7 +282,9 @@ function ImageStage({ image, allowAnnotate, onAddMarker, fitKey }) {
                 )
               : box(
                   'cr-image-placeholder',
-                  image.exists === false
+                  imageQuery.error
+                    ? el(ErrorState, { title: 'Image unavailable', description: imageQuery.error.message })
+                    : image.exists === false
                     ? el(ErrorState, { title: 'File missing', description: `Not found on disk: ${image.path}` })
                     : jsx(GlyphSpinner, { ariaLabel: 'Loading image' })
                 )
@@ -319,15 +362,17 @@ function CompareStrip({ images, leftId, rightId, setLeftId, setRightId }) {
 }
 
 function StageThumb({ image }) {
-  const dataUrl = useImageData(image ? image.id : null)
+  const q = useImageData(image ? image.id : null)
+  const dataUrl = q.data?.data_url
+  if (q.error) return el(ErrorState, { title: "Image unavailable", description: q.error.message })
   if (!image) return box('cr-thumb cr-thumb-empty', '—')
   if (!dataUrl) return box('cr-thumb', jsx(GlyphSpinner, { ariaLabel: 'Loading' }))
   return box('cr-thumb', el('img', { className: 'cr-thumb-img', src: dataUrl, alt: image.label || image.id, draggable: false }))
 }
 
 function OverlaySlider({ left, right, split, setSplit }) {
-  const leftUrl = useImageData(left ? left.id : null)
-  const rightUrl = useImageData(right ? right.id : null)
+  const leftUrl = useImageData(left ? left.id : null).data?.data_url
+  const rightUrl = useImageData(right ? right.id : null).data?.data_url
   return box('cr-overlay', [
     box('cr-overlay-frame', [
       leftUrl ? el('img', { className: 'cr-overlay-img', src: leftUrl, alt: 'base', draggable: false }) : null,
@@ -372,11 +417,10 @@ function AnnotationList({ image, onUpdate, onDelete, onSelect }) {
           el(Textarea, {
             className: 'cr-ann-note',
             rows: 1,
-            defaultValue: marker.note,
+            value: marker.note,
+            onChange: (e) => onUpdate(marker.id, e.target.value),
             placeholder: 'Describe the change at this point…',
-            onBlur: (e) => {
-              if (e.target.value !== marker.note) onUpdate(marker.id, e.target.value)
-            },
+
             onKeyDown: (e) => {
               if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault()
@@ -451,14 +495,29 @@ function VersionHistory({ board, currentId, onSelect }) {
 // ---------------------------------------------------------------------------
 // The page
 // ---------------------------------------------------------------------------
-function ReviewPage() {
+function ReviewPage({ scope }) {
   const queryClient = useQueryClient()
   const boardsQuery = useBoards()
-  const [boardId, setBoardId] = useState(null)
+  const [boardId, setBoardId] = useState(() => storage?.get(`board:${scope}`, null) || null)
   const [currentId, setCurrentId] = useState(null)
   const [leftId, setLeftId] = useState(null)
   const [rightId, setRightId] = useState(null)
   const [overallNote, setOverallNote] = useState('')
+  const [draftNotes, setDraftNotes] = useState({})
+  const [importPath, setImportPath] = useState('')
+  const [importRole, setImportRole] = useState('generated')
+  const [locate, setLocate] = useState(null)
+  const pending = useRef(Promise.resolve())
+  const writeError = useRef(null)
+  const revisionLock = useRef(false)
+  const queueWrite = (work) => {
+    const next = pending.current.then(() => {
+      if (scopeKey() !== scope) throw new Error("Backend changed; queued edit cancelled")
+      return work()
+    })
+    pending.current = next.catch((error) => { writeError.current = error; setStatus(error.message) })
+    return next
+  }
   const [status, setStatus] = useState(null)
   const [newBoardOpen, setNewBoardOpen] = useState(false)
   const [draftTitle, setDraftTitle] = useState('')
@@ -483,27 +542,19 @@ function ReviewPage() {
     setRightId((current) => (images.some((im) => im.id === current) ? current : (newest && newest.id)))
   }, [board ? board.id : null, images.length])
 
-  const current = images.find((im) => im.id === currentId) || null
+  const selected = images.find((im) => im.id === currentId) || null
+  const current = selected ? { ...selected, annotations: (selected.annotations || []).map((a) => ({ ...a, note: draftNotes[a.id] ?? a.note })) } : null
+  useEffect(() => { storage?.set(`board:${scope}`, boardId) }, [scope, boardId])
+  useEffect(() => { setOverallNote(''); setDraftNotes({}) }, [boardId])
 
   const invalidate = () => {
-    queryClient.invalidateQueries({ queryKey: [...DBKEY, 'board'] })
-    queryClient.invalidateQueries({ queryKey: [...DBKEY, 'boards'] })
+    queryClient.invalidateQueries({ queryKey: [...DBKEY, scope, 'board'] })
+    queryClient.invalidateQueries({ queryKey: [...DBKEY, scope, 'boards'] })
   }
 
-  const addMarker = useMutation({
-    mutationFn: ({ x, y }) => api('/annotation', { method: 'POST', body: { image_id: currentId, x, y } }),
-    onSuccess: invalidate
-  })
-  const updateMarker = useMutation({
-    mutationFn: ({ id, note }) => api('/annotation', { method: 'PATCH', body: { id, note } }),
-    onSuccess: invalidate
-  })
-  const deleteMarker = useMutation({
-    mutationFn: ({ id }) => api(`/annotation?id=${encodeURIComponent(id)}`, { method: 'DELETE' }),
-    onSuccess: invalidate
-  })
   const newBoard = useMutation({
     mutationFn: (title) => api('/boards', { method: 'POST', body: { title } }),
+    onError: (error) => setStatus(`Create failed: ${error.message}`),
     onSuccess: (data) => {
       invalidate()
       setNewBoardOpen(false)
@@ -512,6 +563,7 @@ function ReviewPage() {
     }
   })
   const approve = useMutation({
+    onError: (error) => setStatus(`Decision failed: ${error.message}`),
     mutationFn: ({ decision }) => api('/approve', { method: 'POST', body: { board_id: boardId, image_id: currentId, decision } }),
     onSuccess: (data) => {
       invalidate()
@@ -520,6 +572,7 @@ function ReviewPage() {
     }
   })
   const doExport = useMutation({
+    onError: (error) => setStatus(`Export failed: ${error.message}`),
     mutationFn: (format) => api(`/export?board_id=${encodeURIComponent(boardId)}&format=${format}`),
     onSuccess: (data) => {
       if (data && data.ok) {
@@ -533,11 +586,22 @@ function ReviewPage() {
 
   // The revision handoff — the mission's core requirement, through real APIs.
   const requestRevision = async () => {
-    if (!boardId || !currentId) return
+    if (!boardId || !currentId || revisionLock.current) return
+    const target = host.state.focusedSessionId.get()
+    const owner = host.state.focusedSessionOwner?.get()
+    const targetProfile = owner?.profile || host.state.focusedSessionProfile?.get()
+    if (!target || (targetProfile && targetProfile !== host.state.profile.get()) || (owner?.connectionId && owner.connectionId !== (host.state.connectionId?.get() || "local"))) {
+      setStatus("Focus a chat in the board backend profile before requesting a revision")
+      return
+    }
+    revisionLock.current = true
     setRevisionBusy(true)
     try {
       let data
       try {
+        await pending.current
+        if (writeError.current) throw new Error("Feedback save failed; edit the note and retry")
+        if (scopeKey() !== scope) throw new Error("Backend changed; revision cancelled")
         data = await api('/revision', {
           method: 'POST',
           body: { board_id: boardId, image_id: currentId, overall_note: overallNote }
@@ -551,7 +615,6 @@ function ReviewPage() {
         return
       }
       const briefText = data.brief.markdown
-      const target = host.state.focusedSessionId.get() || null
       let sent = false
       try {
         sent = host.composer.submit(target, briefText)
@@ -559,19 +622,24 @@ function ReviewPage() {
         sent = false
       }
       if (sent) {
-        setStatus('Revision brief sent to Hermes — the agent has it now.')
+        setStatus('Revision brief accepted by the composer.')
         haptic('tap')
-        api('/revision-delivered', { method: 'POST', body: { revision_id: data.revision_id } }).catch(() => {})
+        try {
+          await api('/revision-delivered', { method: 'POST', body: { revision_id: data.revision_id } })
+        } catch (error) { setStatus(`Brief submitted; delivery history update failed: ${error.message}`) }
         return
       }
       // Fail-closed: no mounted composer answered, so leave the brief as a draft.
-      const placed = await host.composer.setDraft(target, briefText).catch(() => false)
+      const placed = await host.composer.insertText(target, briefText, { mode: 'block' }).catch(() => false)
       setStatus(
         placed
           ? 'Brief placed in the composer — press Enter to send it to Hermes.'
           : 'Could not reach a conversation composer. Open a chat and retry.'
       )
+    } catch (error) {
+      setStatus(`Revision failed: ${error.message || error}`)
     } finally {
+      revisionLock.current = false
       setRevisionBusy(false)
       invalidate()
     }
@@ -583,7 +651,12 @@ function ReviewPage() {
     if (title) newBoard.mutate(title)
   }
 
-  const removeMarker = (id) => deleteMarker.mutate({ id })
+  const removeMarker = (id) => queueWrite(() => api(`/annotation?id=${encodeURIComponent(id)}`, { method: 'DELETE' })).then(invalidate).catch(() => {})
+  const importImage = useMutation({
+    mutationFn: () => api('/image', { method: 'POST', body: { board_id: boardId, path: importPath.trim(), role: importRole } }),
+    onSuccess: () => { setImportPath(''); invalidate() },
+    onError: (error) => setStatus(`Import failed: ${error.message}`)
+  })
 
   const gateway = useValue(host.state.gateway)
 
@@ -602,7 +675,7 @@ function ReviewPage() {
       setFitKey((k) => k + 1)
     } else if (event.key === 'a' && currentId) {
       approve.mutate({ decision: 'approved' })
-    } else if (event.key === 'r' && currentId) {
+    } else if (event.key === 'r' && currentId && !revisionBusy) {
       requestRevision()
     }
   }
@@ -635,27 +708,32 @@ function ReviewPage() {
                 else if (e.key === 'Escape') setNewBoardOpen(false)
               }
             }),
-            el(Button, { key: 'create', variant: 'default', size: 'sm', onClick: createBoard, disabled: !draftTitle.trim(), children: 'Create' }),
+            el(Button, { key: 'create', variant: 'default', size: 'sm', onClick: createBoard, disabled: !draftTitle.trim() || newBoard.isPending, children: 'Create' }),
             el(Button, { key: 'cancel', variant: 'ghost', size: 'sm', onClick: () => setNewBoardOpen(false), children: 'Cancel' })
           ]
         : el(Button, { variant: 'secondary', size: 'sm', onClick: () => setNewBoardOpen(true), children: 'New board' }),
       el(Button, {
         variant: 'ghost',
         size: 'sm',
-        onClick: () => api('/boards').then(invalidate),
+        onClick: () => api('/boards').then(invalidate).catch((error) => setStatus(error.message)),
         children: 'Refresh'
       }),
-      status ? el('span', { className: 'cr-status' }, status) : null
+      boardId ? el('div', { className: 'cr-import' }, [
+        el(Input, { value: importPath, placeholder: 'Absolute image path on this backend', 'aria-label': 'Image path', onChange: (e) => setImportPath(e.target.value) }),
+        el('select', { value: importRole, 'aria-label': 'Image role', onChange: (e) => setImportRole(e.target.value) }, [el('option', { value: 'generated' }, 'Generated'), el('option', { value: 'reference' }, 'Reference')]),
+        el(Button, { variant: 'secondary', size: 'sm', onClick: () => importImage.mutate(), disabled: !importPath.trim() || importImage.isPending, children: 'Import image' })
+      ]) : null,
+      status ? el('span', { className: 'cr-status', role: 'status' }, status) : null
     ]),
 
     gateway !== 'open'
       ? el(ErrorState, { title: 'Gateway offline', description: 'Creative Review needs the running gateway for its local backend.' })
       : !board
         ? box('cr-body-single', [
-            boardsQuery.error
+            (boardsQuery.error || boardQuery.error)
               ? el(ErrorState, {
                   title: 'Backend unavailable',
-                  description: 'The Creative Review backend is not answering. Enable the plugin (hermes plugins enable creative-review) and restart the gateway.'
+                  description: (boardsQuery.error || boardQuery.error).message
                 })
               : boardsQuery.isLoading
                 ? jsx(GlyphSpinner, { ariaLabel: 'Loading' })
@@ -680,8 +758,11 @@ function ReviewPage() {
               el(ImageStage, {
                 image: current,
                 allowAnnotate: true,
-                onAddMarker: (x, y) => addMarker.mutate({ x, y }),
-                fitKey
+                onAddMarker: (x, y) => {
+                  const iid = currentId
+                  queueWrite(() => api('/annotation', { method: 'POST', body: { image_id: iid, x, y } })).then(invalidate).catch(() => {})
+                },
+                fitKey, locate
               }),
               box('cr-actions', [
                 el(Button, { variant: 'default', size: 'sm', onClick: requestRevision, disabled: !currentId || revisionBusy, loading: revisionBusy, children: 'Request Revision' }),
@@ -697,9 +778,13 @@ function ReviewPage() {
                 box('cr-section-title', `Feedback on “${txt(current ? current.label : '')}”`),
                 el(AnnotationList, {
                   image: current,
-                  onUpdate: (id, note) => updateMarker.mutate({ id, note }),
+                  onUpdate: (id, note) => {
+                    setDraftNotes((notes) => ({ ...notes, [id]: note }))
+                    writeError.current = null
+                    queueWrite(() => api('/annotation', { method: 'PATCH', body: { id, note } })).then(invalidate).catch(() => {})
+                  },
                   onDelete: removeMarker,
-                  onSelect: () => {}
+                  onSelect: (marker) => setLocate({ ...marker, nonce: Date.now() })
                 })
               ]),
               box('cr-section', [
@@ -720,6 +805,11 @@ function ReviewPage() {
 // ---------------------------------------------------------------------------
 // Status-bar chip
 // ---------------------------------------------------------------------------
+function ScopedReview() {
+  const scope = useScope()
+  return jsx(ReviewPage, { scope }, scope)
+}
+
 function ReviewChip() {
   const boardsQuery = useBoards()
   const count = boardsQuery.data && boardsQuery.data.ok ? boardsQuery.data.count : 0
@@ -754,6 +844,7 @@ const CSS = `
 .cr-toolbar{display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--ui-stroke-secondary);flex-wrap:wrap}
 .cr-toolbar .cr-select{max-width:280px}
 .cr-newboard{width:180px}
+.cr-import{display:flex;gap:6px;align-items:center;flex:1;min-width:260px}
 .cr-page:focus{outline:none}
 .cr-select{appearance:none;height:26px;padding:0 8px;border-radius:6px;border:1px solid var(--ui-stroke-secondary);background:var(--ui-bg-control,var(--background));color:var(--ui-text-primary);font:inherit}
 .cr-status{margin-left:auto;color:var(--ui-text-secondary);font-size:11.5px;max-width:44%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -770,11 +861,11 @@ const CSS = `
 .cr-stage-inner{position:absolute;inset:0;transform-origin:0 0;will-change:transform}
 .cr-frame{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;min-width:0;min-height:0}
 .cr-canvas{position:relative;display:flex;max-width:100%;max-height:100%;min-width:0;min-height:0}
-.cr-image{display:block;max-width:100%;max-height:100%;width:auto;height:auto;user-select:none}
+.cr-image{display:block;width:100%;height:100%;user-select:none}
 .cr-image-annotate{cursor:crosshair}
 .cr-image-placeholder{position:absolute;inset:0;display:grid;place-items:center;padding:16px;text-align:center}
 .cr-markers{position:absolute;inset:0;pointer-events:none}
-.cr-marker{position:absolute;transform:translate(-50%,-50%);display:flex;align-items:center;gap:5px}
+.cr-marker{position:absolute;transform:translate(-10px,-10px);display:flex;align-items:center;gap:5px}
 .cr-marker-dot{display:grid;place-items:center;min-width:20px;height:20px;padding:0 5px;border-radius:10px;background:var(--ui-accent);color:var(--ui-accent-fg,#fff);font-size:11px;font-weight:700;box-shadow:0 0 0 2px var(--background)}
 .cr-marker-label{max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;padding:2px 6px;border-radius:5px;background:var(--ui-bg-card,var(--background));border:1px solid var(--ui-stroke-secondary);color:var(--ui-text-secondary)}
 .cr-stage-tools{position:absolute;right:8px;bottom:8px;display:flex;align-items:center;gap:6px;background:var(--ui-bg-card,var(--background));border:1px solid var(--ui-stroke-secondary);border-radius:8px;padding:3px 6px}
@@ -812,6 +903,8 @@ const CSS = `
 .cr-chip{display:inline-flex;height:100%;align-items:center;gap:4px;padding:0 6px;font-size:.6875rem;color:var(--ui-text-tertiary)}
 .cr-chip:hover{color:var(--ui-text-primary);background:var(--chrome-action-hover)}
 .cr-chip-dot{width:6px;height:6px;border-radius:3px;background:var(--ui-accent)}
+@media(max-width:1000px){.cr-body{grid-template-columns:140px minmax(0,1fr)}.cr-col-ann{grid-column:1/-1;border-left:0}.cr-status{max-width:100%}}
+@media(max-width:600px){.cr-body{display:flex;flex-direction:column}.cr-col-side{max-height:160px}.cr-compare-pickers{flex-wrap:wrap}}
 `
 
 function injectStyle() {
@@ -833,6 +926,7 @@ export default {
   name: 'Creative Review',
   register(ctx) {
     rest = (path, options) => ctx.rest(path, options)
+    storage = ctx.storage
     ctx.onDispose(injectStyle())
 
     ctx.registerMany([
@@ -840,7 +934,14 @@ export default {
         id: 'page',
         area: ROUTES_AREA,
         data: { path: PAGE_PATH },
-        render: () => jsx(ReviewPage, {})
+        render: () => jsx(ScopedReview, {})
+      },
+      {
+        id: 'desk',
+        area: 'panes',
+        title: 'Creative Review',
+        data: { placement: 'right', dock: { pane: 'workspace', pos: 'right' }, width: '720px' },
+        render: () => jsx(ScopedReview, {})
       },
       {
         id: 'nav',

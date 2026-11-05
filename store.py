@@ -15,6 +15,7 @@ user's own disk and no network call is ever made.
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import threading
 import time
@@ -227,6 +228,9 @@ def set_board_status(board_id: str, status: str) -> None:
 def describe_path(path: str) -> dict[str, Any]:
     """Validate and describe a local image path without copying it."""
     p = Path(path).expanduser()
+    if not p.is_absolute():
+        raise ValueError("image path must be absolute")
+    p = p.resolve()
     exists = p.is_file()
     ext = p.suffix.lower()
     return {
@@ -241,8 +245,8 @@ def describe_path(path: str) -> dict[str, Any]:
 def add_image(board_id: str, path: str, role: str = ROLE_GENERATED,
               label: str = "", parent_id: Optional[str] = None,
               meta: Optional[dict] = None) -> dict[str, Any]:
-    if role not in VALID_ROLES:
-        raise ValueError(f"role must be one of {sorted(VALID_ROLES)}")
+    if role not in {ROLE_REFERENCE, ROLE_GENERATED}:
+        raise ValueError("import role must be reference or generated; approve separately")
     if get_board(board_id) is None:
         raise ValueError(f"unknown board: {board_id}")
     if parent_id:
@@ -256,6 +260,7 @@ def add_image(board_id: str, path: str, role: str = ROLE_GENERATED,
         raise FileNotFoundError(f"image file not found: {info['path']}")
     if not info["supported"]:
         raise ValueError(f"unsupported image extension: {info['extension'] or '(none)'}")
+    _validated_bytes(Path(info["path"]), MAX_IMAGE_BYTES)
     image_id = _new_id("img")
     conn = _connect()
     with conn:
@@ -306,10 +311,11 @@ def add_annotation(image_id: str, x: float, y: float, note: str = "",
     image = get_image(image_id)
     if image is None:
         raise ValueError(f"unknown image: {image_id}")
-    x = min(max(float(x), 0.0), 1.0)
-    y = min(max(float(y), 0.0), 1.0)
+    x = _coordinate(x)
+    y = _coordinate(y)
     conn = _connect()
     with conn:
+        conn.execute("BEGIN IMMEDIATE")
         number = _next_annotation_number(conn, image_id)
         ann_id = _new_id("ann")
         conn.execute(
@@ -331,10 +337,10 @@ def update_annotation(ann_id: str, note: Optional[str] = None,
         params.append(note)
     if x is not None:
         fields.append("x = ?")
-        params.append(min(max(float(x), 0.0), 1.0))
+        params.append(_coordinate(x))
     if y is not None:
         fields.append("y = ?")
-        params.append(min(max(float(y), 0.0), 1.0))
+        params.append(_coordinate(y))
     if not fields:
         return _row_to_dict(conn.execute(
             "SELECT * FROM annotations WHERE id = ?", (ann_id,)).fetchone())
@@ -357,6 +363,9 @@ def delete_annotation(ann_id: str) -> bool:
 # --------------------------------------------------------------------------- #
 def create_revision(board_id: str, parent_image_id: Optional[str], brief: str,
                     child_image_id: Optional[str] = None) -> dict[str, Any]:
+    require_board_image(board_id, parent_image_id)
+    if child_image_id:
+        require_board_image(board_id, child_image_id)
     rev_id = _new_id("rev")
     conn = _connect()
     with conn:
@@ -373,11 +382,17 @@ def create_revision(board_id: str, parent_image_id: Optional[str], brief: str,
 def mark_revision_delivered(rev_id: str) -> None:
     conn = _connect()
     with conn:
-        conn.execute("UPDATE revisions SET delivered = 1 WHERE id = ?", (rev_id,))
+        cursor = conn.execute("UPDATE revisions SET delivered = 1 WHERE id = ?", (rev_id,))
+        if not cursor.rowcount:
+            raise ValueError(f"unknown revision: {rev_id}")
 
 
 def link_revision_child(board_id: str, parent_image_id: str, child_image_id: str) -> None:
     """Attach a newly registered child image to the newest open revision."""
+    require_board_image(board_id, parent_image_id)
+    child = require_board_image(board_id, child_image_id)
+    if child["parent_id"] != parent_image_id:
+        raise ValueError("revision child does not descend from this parent")
     conn = _connect()
     with conn:
         conn.execute(
@@ -393,6 +408,9 @@ def link_revision_child(board_id: str, parent_image_id: str, child_image_id: str
 # Approvals
 # --------------------------------------------------------------------------- #
 def set_approval(board_id: str, image_id: str, decision: str) -> dict[str, Any]:
+    if decision not in {"approved", "rejected"}:
+        raise ValueError("decision must be approved or rejected")
+    require_board_image(board_id, image_id)
     conn = _connect()
     with conn:
         conn.execute(
@@ -426,6 +444,45 @@ def get_approval(board_id: str) -> Optional[dict[str, Any]]:
 # --------------------------------------------------------------------------- #
 # Image bytes (on-demand, local only)
 # --------------------------------------------------------------------------- #
+def require_board_image(board_id: str, image_id: Optional[str]) -> dict[str, Any]:
+    if get_board(board_id) is None:
+        raise ValueError(f"unknown board: {board_id}")
+    image = get_image(image_id or "")
+    if image is None:
+        raise ValueError(f"unknown image: {image_id}")
+    if image["board_id"] != board_id:
+        raise ValueError("image belongs to another board")
+    return image
+
+
+def _coordinate(value: float) -> float:
+    value = float(value)
+    if not math.isfinite(value):
+        raise ValueError("coordinate must be finite")
+    return min(max(value, 0.0), 1.0)
+
+
+def _validated_bytes(path: Path, limit: int) -> bytes:
+    # Read at most limit+1, not stat then an unbounded read (file may grow).
+    with path.open("rb") as stream:
+        raw = stream.read(limit + 1)
+    if len(raw) > limit:
+        raise ValueError("image exceeds size limit")
+    ext = path.suffix.lower()
+    signatures = {
+        ".png": raw.startswith(b"\x89PNG\r\n\x1a\n"),
+        ".jpg": raw.startswith(b"\xff\xd8\xff"),
+        ".jpeg": raw.startswith(b"\xff\xd8\xff"),
+        ".gif": raw[:6] in {b"GIF87a", b"GIF89a"},
+        ".bmp": raw.startswith(b"BM"),
+        ".webp": raw[:4] == b"RIFF" and raw[8:12] == b"WEBP",
+        ".avif": raw[4:8] == b"ftyp" and any(raw[n:n+4] in {b"avif", b"avis"} for n in range(8, min(len(raw), 64), 4)),
+    }
+    if not signatures.get(ext, False):
+        raise ValueError("file signature does not match a supported image format")
+    return raw
+
+
 def read_image_bytes(image_id: str, max_bytes: int = MAX_IMAGE_BYTES) -> dict[str, Any]:
     """Read one registered image's bytes from disk. Local only, never network."""
     image = get_image(image_id)
@@ -443,7 +500,11 @@ def read_image_bytes(image_id: str, max_bytes: int = MAX_IMAGE_BYTES) -> dict[st
     if mime is None:
         return {"ok": False, "error": "unsupported",
                 "message": f"unsupported extension {path.suffix}"}
-    return {"ok": True, "mime": mime, "size": size, "bytes": path.read_bytes()}
+    try:
+        raw = _validated_bytes(path, max_bytes)
+    except ValueError as exc:
+        return {"ok": False, "error": "invalid-image", "message": str(exc)}
+    return {"ok": True, "mime": mime, "size": len(raw), "bytes": raw}
 
 
 def read_image_data_url(image_id: str, max_bytes: int = MAX_IMAGE_BYTES) -> dict[str, Any]:

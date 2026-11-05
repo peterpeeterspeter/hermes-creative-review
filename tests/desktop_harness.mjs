@@ -20,6 +20,7 @@ const SDK_STUB = `
 export const host = {
   state: {
     gateway: { get: () => 'open' },
+    profile: { get: () => 'default' }, connectionId: { get: () => 'local' },
     focusedSessionId: { get: () => 'sess-test' },
     busyBySession: { get: () => ({}) }
   },
@@ -134,14 +135,14 @@ try {
     try { byArea['palette'].data.run(); return true } catch { return false }
   })())
   check('registers a status-bar chip', !!byArea['statusBar.right'])
-  check('chip renders without throwing', (() => {
+  check('chip returns a React descriptor (not mounted)', (() => {
     try { return !!byArea['statusBar.right'].render() } catch { return false }
   })())
-  check('page renders without throwing', (() => {
+  check('page returns a React descriptor (not mounted)', (() => {
     try { return !!byArea['routes'].render() } catch { return false }
   })())
   check('registers a dispose hook (style teardown)', disposers.length >= 1)
-  check('registered four contributions', contributions.length === 4, `(got ${contributions.length})`)
+  check('registered five contributions', contributions.length === 5, `(got ${contributions.length})`)
 
   // Regression guards for bugs found in review: these must never come back.
   const source = readFileSync(PLUGIN_JS, 'utf8')

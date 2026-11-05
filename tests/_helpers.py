@@ -13,7 +13,8 @@ import sys
 import tempfile
 import types
 
-os.environ.setdefault("HERMES_HOME", tempfile.mkdtemp(prefix="cr-test-home-"))
+if "HERMES_HOME" not in os.environ:
+    os.environ["HERMES_HOME"] = tempfile.mkdtemp(prefix="cr-test-home-", dir=os.environ.get("TMPDIR"))
 
 _REPO = pathlib.Path(
     os.environ.get("HERMES_AGENT_REPO")

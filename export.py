@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import shutil
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 
@@ -31,14 +32,12 @@ def _export_dir(out_dir: Optional[str]) -> Path:
 
 def _approved_image(board: dict[str, Any]) -> Optional[dict[str, Any]]:
     approval = board.get("approval")
-    if approval:
+    if approval and approval.get("decision") == "approved":
         for img in board.get("images", []):
             if img.get("id") == approval.get("image_id"):
                 return img
-    # Fall back to the newest image marked approved, else the newest image.
-    approved = [im for im in board.get("images", []) if im.get("role") == "approved"]
-    images = board.get("images", [])
-    return (approved[-1] if approved else (images[-1] if images else None))
+    # History-only export is allowed, but never invent an approval.
+    return None
 
 
 def _copy_approved(image: Optional[dict[str, Any]], dest_dir: Path) -> Optional[str]:
@@ -67,7 +66,8 @@ def build_bundle(board: dict[str, Any], approved_path: Optional[str]) -> dict[st
             "status": board.get("status"),
             "created_at": board.get("created_at"),
         },
-        "approved_image_id": (board.get("approval") or {}).get("image_id"),
+        "approved_image_id": ((board.get("approval") or {}).get("image_id")
+                              if (board.get("approval") or {}).get("decision") == "approved" else None),
         "approved_export_path": approved_path,
         "images": [
             {
@@ -131,7 +131,8 @@ def _render_markdown(board: dict[str, Any], bundle: dict[str, Any]) -> str:
 
 def export_board(board: dict[str, Any], fmt: str = "json",
                  out_dir: Optional[str] = None) -> dict[str, Any]:
-    dest = _export_dir(out_dir)
+    dest = _export_dir(out_dir) / f"{_stamp(board)}-{uuid.uuid4().hex[:12]}"
+    dest.mkdir()
     approved = _approved_image(board)
     approved_path = _copy_approved(approved, dest)
     stamp = _stamp(board)

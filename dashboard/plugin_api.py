@@ -128,15 +128,14 @@ async def image_data(image_id: str) -> dict:
 @router.get("/file")
 async def raw_file(image_id: str):
     try:
-        data = store.read_image_data_url(image_id)
+        data = store.read_image_bytes(image_id)
         if not data.get("ok"):
             payload = {k: v for k, v in data.items() if k != "data_url"}
             import json
             return Response(content=json.dumps(payload), media_type="application/json",
                             status_code=404)
-        import base64
         mime = data["mime"]
-        raw = base64.b64decode(data["data_url"].split(",", 1)[1])
+        raw = data["bytes"]
         return Response(content=raw, media_type=mime, headers={
             "Content-Disposition": f'inline; filename="{image_id}"'})
     except Exception as exc:  # noqa: BLE001
@@ -207,6 +206,7 @@ async def build_revision(body: dict) -> dict:
         image = store.get_image(image_id)
         if image is None:
             return {"ok": False, "error": "unknown image", "reason": "not-found"}
+        store.require_board_image(board_id, image_id)
         reference = next((im for im in board.get("images", [])
                           if im.get("role") == store.ROLE_REFERENCE), None)
         data = brief.build_brief(board, image, reference=reference, overall_note=overall_note)
@@ -252,7 +252,9 @@ async def export_board(board_id: str, format: str = "json") -> dict:  # noqa: A0
         board = store.get_board(board_id)
         if board is None:
             return {"ok": False, "error": "unknown board", "reason": "not-found"}
-        fmt = "markdown" if format == "markdown" else "json"
+        if format not in {"json", "markdown"}:
+            return {"ok": False, "error": "format must be json or markdown"}
+        fmt = format
         return export.export_board(board, fmt=fmt)
     except Exception as exc:  # noqa: BLE001
         return _bad(exc)

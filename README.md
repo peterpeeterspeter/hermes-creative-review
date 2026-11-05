@@ -34,7 +34,7 @@ Built for the **Nous Research Plugin Hackathon**.
 hermes plugins install creative-review
 
 # or straight from the repository
-hermes plugins install <owner>/hermes-creative-review
+hermes plugins install peterpeeterspeter/hermes-creative-review
 hermes plugins enable creative-review
 ```
 
@@ -49,14 +49,12 @@ library and Hermes' own FastAPI.
 
 1. Ask Hermes to generate an image. The agent creates a board and registers the
    image (and any reference) with its tools.
-2. Open **Creative Review** (sidebar row, ⌘K command, or the `review N` chip).
+2. Open **Creative Review** (sidebar row, ⌘K command, `review N` chip, or docked desk pane). You can also import by absolute image path using **Import image**; paths refer to the selected backend machine.
 3. Compare, zoom in, and click the problem spots to add numbered notes.
-4. Press **Request Revision** — the brief lands in the open Hermes chat; the
-   agent produces a new version and links it to its parent.
+4. Focus a chat in the board backend profile, then press **Request Revision**. The original target is pinned before saving feedback/building the brief. If that composer accepts the submission, Hermes receives a user turn; otherwise the brief is appended as a draft, without replacing your text. A backend change cancels the handoff.
 5. **Approve** the winner and **Export** JSON/Markdown.
 
-Keyboard: zoom with the wheel, pan by dragging (middle mouse or when not in
-annotate mode), **Fit** resets the view.
+Keyboard: wheel zoom; middle-mouse or Alt-drag pan; **Fit** / `f` reset; `↑`/`↓` or `[`/`]` select versions; `a` approves; `r` requests revision. **Locate** centers a marker. Shortcuts are ignored in text fields.
 
 ## Architecture
 
@@ -78,17 +76,19 @@ tests/                 unit tests for store / brief / export
 
 ## Status & verification
 
-Everything below was run against the shipped plugin, not a mock:
+The shipped Python modules and Desktop component code are exercised. The Desktop host SDK is mocked in automated UI tests; these are not live Electron/composer delivery tests.
 
 | Check | Command | Result |
 |---|---|---|
 | Catalog admission | `hermes plugins validate . --install-deps` | ✅ all green (incl. `desktop surface`, `security scan`, `no core override`) |
 | Runtime registration | `hermes plugins doctor .` | ✅ 7 tools, registration passed |
-| Unit + tool contract | `python -m unittest discover -s tests` | ✅ 25 passed |
-| Backend routes (real ASGI app) | `python tests/integration_backend.py` | ✅ 21 passed |
-| Desktop registration | `node tests/desktop_harness.mjs` | ✅ 15 passed |
+| Unit + tool contract | `python -m unittest discover -s tests` | ✅ 39 passed |
+| Backend routes (real ASGI app) | `python tests/integration_backend.py` | ✅ 25 passed |
+| Desktop registration | `node tests/desktop_harness.mjs` | ✅ 20 passed |
 
-`./scripts/run_tests.sh` runs all five in one go.
+| Mounted React interactions | `node tests/desktop_mounted.mjs` | ✅ 17 passed (real React/ReactDOM + jsdom, mocked SDK boundary) |
+
+`./scripts/run_tests.sh` runs all six checks with isolated test data. The Node tests resolve React, ReactDOM, jsdom and TanStack Query from `HERMES_AGENT_REPO` (defaults to the local Hermes checkout); these are test dependencies, not plugin runtime imports.
 
 Also exercised end to end in a **real agent conversation**: a one-shot Hermes turn
 created a board and registered two images through the live tools
@@ -99,9 +99,7 @@ process — persistence across processes, not just within one.
 
 - **The visual Desktop pane.** The Electron half loads only after the app
   **Rescans** and the user switches the plugin on under **Capabilities →
-  Plugins** (both in-app actions). Until then the pane cannot be scripted or
-  screenshotted from outside the app; the registration and rendering of every
-  contribution is covered by `tests/desktop_harness.mjs` instead.
+  Plugins**. The registration harness only checks declarations. Mounted tests exercise components/handlers but do not verify Electron layout, native SDK controls, real composer acceptance or an image-generation revision turn. Those still need a live app pass.
 - **Screenshots / demo recording.** Pending the above; the shot list is in
   [docs/DEMO.md](docs/DEMO.md).
 
@@ -109,11 +107,10 @@ process — persistence across processes, not just within one.
 
 - **Local-first.** All state lives in `<HERMES_HOME>/plugin-data/creative-review/`
   (SQLite). Nothing is uploaded.
-- **No network calls.** The backend only reads image files you registered, by
-  path, on your own machine, and serves them to the pane as data URLs.
+- **No direct third-party service calls.** The pane uses the authenticated Hermes backend API (which may be remote). Revision submission may invoke your configured model/image provider through Hermes. Registered images remain on the backend machine; the plugin itself does not upload them to a generation service.
 - **No credentials, no shell, no background processes, no telemetry.**
 - **Exports** are written to the plugin's data folder (or an `out_dir` you give)
-  and never leave the machine.
+  and are not uploaded by the plugin. Each export has a unique directory; unapproved/rejected boards export history only, never an image labelled approved.
 
 ## License
 

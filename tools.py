@@ -88,6 +88,7 @@ def revision_brief(args: dict, **kwargs: Any) -> str:
         image = store.get_image(image_id)
         if image is None:
             return _err(f"unknown image: {image_id}", reason="not-found")
+        store.require_board_image(board_id, image_id)
         reference = next((im for im in board.get("images", [])
                           if im.get("role") == store.ROLE_REFERENCE), None)
         data = brief.build_brief(board, image, reference=reference, overall_note=overall_note)

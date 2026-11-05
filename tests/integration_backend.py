@@ -14,7 +14,12 @@ from __future__ import annotations
 import importlib.util
 import pathlib
 import sys
-import types
+import os
+import tempfile
+import subprocess
+
+TEST_ROOT = tempfile.TemporaryDirectory(prefix="cr-asgi-", dir=os.environ.get("TMPDIR"))
+os.environ["HERMES_HOME"] = str(pathlib.Path(TEST_ROOT.name) / "home")
 
 REPO = pathlib.Path.home() / ".hermes" / "hermes-agent"
 if REPO.is_dir() and str(REPO) not in sys.path:
@@ -57,23 +62,26 @@ def main() -> int:
     r = client.get("/api/plugins/creative-review/health")
     check("health", r.status_code == 200 and r.json()["plugin"] == "creative-review")
 
-    # Cross-process persistence: the board the live agent created earlier.
-    boards = client.get("/api/plugins/creative-review/boards").json()["boards"]
-    live = [b for b in boards if b["title"] == "Live E2E review"]
-    check("persistence: live-agent board survives in a new process", len(live) >= 1,
-          f"(boards={[b['title'] for b in boards]})")
+    # Own fixtures; never read or mutate the user profile.
+    sys.path.insert(0, str(PLUGIN_DIR / "tests"))
+    from _helpers import make_png
+    for name in ["reference", "v1", "v2"]:
+        make_png(pathlib.Path(TEST_ROOT.name) / f"{name}.png")
 
     board = client.post("/api/plugins/creative-review/boards",
                         json={"title": "Backend E2E"}).json()["board"]
     bid = board["id"]
     check("create board", bid.startswith("board_"))
+    code = f"import sys;sys.path.insert(0,{str(PLUGIN_DIR / 'tests')!r});from _helpers import load;print(load('store').get_board({bid!r})['id'])"
+    child = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+    check("persistence across independent process", child.stdout.strip() == bid)
 
     ref = client.post("/api/plugins/creative-review/image", json={
-        "board_id": bid, "path": "/tmp/cr-e2e/reference.png", "role": "reference"}).json()
+        "board_id": bid, "path": str(pathlib.Path(TEST_ROOT.name) / "reference.png"), "role": "reference"}).json()
     check("register reference image", ref.get("ok") and ref["image"]["role"] == "reference")
 
     v1 = client.post("/api/plugins/creative-review/image", json={
-        "board_id": bid, "path": "/tmp/cr-e2e/v1.png", "role": "generated",
+        "board_id": bid, "path": str(pathlib.Path(TEST_ROOT.name) / "v1.png"), "role": "generated",
         "label": "v1"}).json()["image"]
 
     missing = client.post("/api/plugins/creative-review/image", json={
@@ -106,7 +114,7 @@ def main() -> int:
     check("brief instructs parent-linked registration", 'parent_id="%s"' % v1["id"] in md)
 
     v2 = client.post("/api/plugins/creative-review/image", json={
-        "board_id": bid, "path": "/tmp/cr-e2e/v2.png", "role": "generated",
+        "board_id": bid, "path": str(pathlib.Path(TEST_ROOT.name) / "v2.png"), "role": "generated",
         "label": "v2", "parent_id": v1["id"]}).json()["image"]
     board = client.get(f"/api/plugins/creative-review/board?board_id={bid}").json()["board"]
     rev = board["revisions"][0]
@@ -128,6 +136,14 @@ def main() -> int:
         "board_id": bid, "image_id": v2["id"], "decision": "maybe"}).json()
     check("invalid decision rejected", bad.get("ok") is False)
 
+    other = client.post("/api/plugins/creative-review/boards", json={"title": "Other"}).json()["board"]["id"]
+    for route in ["approve", "revision"]:
+        bad = client.post(f"/api/plugins/creative-review/{route}", json={"board_id": other, "image_id": v1["id"]}).json()
+        check(f"{route}: cross-board rejected", bad.get("ok") is False)
+    bad = client.post("/api/plugins/creative-review/revision-delivered", json={"revision_id": "rev_missing"}).json()
+    check("unknown delivery id rejected", bad.get("ok") is False)
+    raw = client.get(f"/api/plugins/creative-review/file?image_id={v1['id']}")
+    check("raw file route serves PNG bytes", raw.content.startswith(b"\x89PNG\r\n\x1a\n"))
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 
