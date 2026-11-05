@@ -8,7 +8,7 @@
  *
  * Run:  node tests/desktop_harness.mjs
  */
-import { mkdtempSync, mkdirSync, writeFileSync, copyFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, copyFileSync, rmSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -142,6 +142,19 @@ try {
   })())
   check('registers a dispose hook (style teardown)', disposers.length >= 1)
   check('registered four contributions', contributions.length === 4, `(got ${contributions.length})`)
+
+  // Regression guards for bugs found in review: these must never come back.
+  const source = readFileSync(PLUGIN_JS, 'utf8')
+  check('no window.prompt (Electron does not implement it)',
+    !/window\.prompt\s*\(/.test(source))
+  check('no invalid Button variant (primary/accent/good are not in the kit)',
+    !/variant:\s*'(primary|accent|good)'/.test(source))
+  check('no invalid Badge variant (accent/good are not in the kit)',
+    !/Badge[^)]*variant:\s*'(accent|good)'/.test(source))
+  check('revision handoff uses host.composer.submit',
+    /host\.composer\.submit\(/.test(source))
+  check('no raw DOM reach into app markup',
+    !/document\.querySelector/.test(source))
 
   console.log(`\n${pass} passed, ${fail} failed`)
 } catch (error) {

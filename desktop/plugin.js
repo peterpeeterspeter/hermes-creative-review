@@ -38,7 +38,7 @@ import {
   useQueryClient,
   useValue
 } from '@hermes/plugin-sdk'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 export const ID = 'creative-review'
@@ -46,7 +46,8 @@ export const PAGE_PATH = '/creative-review'
 const STYLE_ID = 'creative-review-style'
 const POLL_MS = 4000
 const DBKEY = [ID]
-const MARKER_COLORS = { reference: 'muted', generated: 'accent', approved: 'good' }
+// Badge accepts only: default | muted | success | warn | destructive | outline | solid.
+const ROLE_BADGE = { reference: 'muted', generated: 'default', approved: 'success' }
 
 // Bound in register(); ctx.rest is scoped to this plugin's namespace.
 let rest = null
@@ -203,40 +204,48 @@ function ImageStage({ image, allowAnnotate, onAddMarker, fitKey }) {
           onPointerLeave: onPointerUp
         },
         [
-          dataUrl
-            ? el('img', {
-                className: cn('cr-image', allowAnnotate && 'cr-image-annotate'),
-                src: dataUrl,
-                alt: image.label || image.id,
-                draggable: false,
-                onClick: onClickImage
-              })
-            : box(
-                'cr-image-placeholder',
-                image.exists === false
-                  ? el(ErrorState, { title: 'File missing', description: `Not found on disk: ${image.path}` })
-                  : jsx(GlyphSpinner, { ariaLabel: 'Loading image' })
-              ),
-          el(
-            'div',
-            { className: 'cr-markers' },
-            markers.map((marker) =>
-              el(
-                'div',
-                {
-                  key: marker.id,
-                  className: 'cr-marker',
-                  style: { left: pct(marker.x), top: pct(marker.y) }
-                },
-                [
-                  el('span', { className: 'cr-marker-dot' }, txt(marker.number)),
-                  marker.note
-                    ? el('span', { className: 'cr-marker-label' }, txt(marker.note))
-                    : null
-                ]
-              )
-            )
-          )
+          el('div', { className: 'cr-frame' }, [
+            dataUrl
+              ? el(
+                  'div',
+                  { className: 'cr-canvas' },
+                  [
+                    el('img', {
+                      className: cn('cr-image', allowAnnotate && 'cr-image-annotate'),
+                      src: dataUrl,
+                      alt: image.label || image.id,
+                      draggable: false,
+                      onClick: onClickImage
+                    }),
+                    el(
+                      'div',
+                      { className: 'cr-markers' },
+                      markers.map((marker) =>
+                        el(
+                          'div',
+                          {
+                            key: marker.id,
+                            className: 'cr-marker',
+                            style: { left: pct(marker.x), top: pct(marker.y) }
+                          },
+                          [
+                            el('span', { className: 'cr-marker-dot' }, txt(marker.number)),
+                            marker.note
+                              ? el('span', { className: 'cr-marker-label' }, txt(marker.note))
+                              : null
+                          ]
+                        )
+                      )
+                    )
+                  ]
+                )
+              : box(
+                  'cr-image-placeholder',
+                  image.exists === false
+                    ? el(ErrorState, { title: 'File missing', description: `Not found on disk: ${image.path}` })
+                    : jsx(GlyphSpinner, { ariaLabel: 'Loading image' })
+                )
+          ])
         ]
       ),
       box('cr-stage-tools', [
@@ -428,7 +437,7 @@ function VersionHistory({ board, currentId, onSelect }) {
           onClick: () => onSelect(im.id)
         },
         [
-          el(Badge, { variant: MARKER_COLORS[im.role] || 'muted', size: 'xs' }, txt(im.role)),
+          el(Badge, { variant: ROLE_BADGE[im.role] || 'muted', size: 'xs' }, txt(im.role)),
           el('span', { className: 'cr-version-label' }, txt(im.label || shortId(im.id))),
           (im.annotations || []).length
             ? el('span', { className: 'cr-version-count' }, `${im.annotations.length} note${im.annotations.length === 1 ? '' : 's'}`)
@@ -451,6 +460,10 @@ function ReviewPage() {
   const [rightId, setRightId] = useState(null)
   const [overallNote, setOverallNote] = useState('')
   const [status, setStatus] = useState(null)
+  const [newBoardOpen, setNewBoardOpen] = useState(false)
+  const [draftTitle, setDraftTitle] = useState('')
+  const [revisionBusy, setRevisionBusy] = useState(false)
+  const [fitKey, setFitKey] = useState(0)
   const boardQuery = useBoard(boardId)
 
   const boards = (boardsQuery.data && boardsQuery.data.boards) || []
@@ -493,6 +506,8 @@ function ReviewPage() {
     mutationFn: (title) => api('/boards', { method: 'POST', body: { title } }),
     onSuccess: (data) => {
       invalidate()
+      setNewBoardOpen(false)
+      setDraftTitle('')
       if (data && data.ok && data.board) setBoardId(data.board.id)
     }
   })
@@ -519,48 +534,52 @@ function ReviewPage() {
   // The revision handoff — the mission's core requirement, through real APIs.
   const requestRevision = async () => {
     if (!boardId || !currentId) return
-    setStatus('Building revision brief…')
-    let data
+    setRevisionBusy(true)
     try {
-      data = await api('/revision', {
-        method: 'POST',
-        body: { board_id: boardId, image_id: currentId, overall_note: overallNote }
-      })
-    } catch (error) {
-      setStatus(`Could not build brief: ${error.message || error}`)
-      return
-    }
-    if (!data || !data.ok) {
-      setStatus(`Could not build brief: ${(data && data.error) || 'unknown'}`)
-      return
-    }
-    const briefText = data.brief.markdown
-    const target = host.state.focusedSessionId.get() || null
-    let sent = false
-    try {
-      sent = host.composer.submit(target, briefText)
-    } catch (error) {
-      sent = false
-    }
-    if (sent) {
-      setStatus('Revision brief sent to Hermes — the agent has it now.')
-      haptic('tap')
-      api('/revision-delivered', { method: 'POST', body: { revision_id: data.revision_id } }).catch(() => {})
+      let data
+      try {
+        data = await api('/revision', {
+          method: 'POST',
+          body: { board_id: boardId, image_id: currentId, overall_note: overallNote }
+        })
+      } catch (error) {
+        setStatus(`Could not build brief: ${error.message || error}`)
+        return
+      }
+      if (!data || !data.ok) {
+        setStatus(`Could not build brief: ${(data && data.error) || 'unknown'}`)
+        return
+      }
+      const briefText = data.brief.markdown
+      const target = host.state.focusedSessionId.get() || null
+      let sent = false
+      try {
+        sent = host.composer.submit(target, briefText)
+      } catch (error) {
+        sent = false
+      }
+      if (sent) {
+        setStatus('Revision brief sent to Hermes — the agent has it now.')
+        haptic('tap')
+        api('/revision-delivered', { method: 'POST', body: { revision_id: data.revision_id } }).catch(() => {})
+        return
+      }
+      // Fail-closed: no mounted composer answered, so leave the brief as a draft.
+      const placed = await host.composer.setDraft(target, briefText).catch(() => false)
+      setStatus(
+        placed
+          ? 'Brief placed in the composer — press Enter to send it to Hermes.'
+          : 'Could not reach a conversation composer. Open a chat and retry.'
+      )
+    } finally {
+      setRevisionBusy(false)
       invalidate()
-      return
     }
-    // Fallback: put it in the composer as a draft the user can send.
-    const placed = await host.composer.setDraft(target, briefText).catch(() => false)
-    setStatus(
-      placed
-        ? 'Brief placed in the composer — press Enter to send it to Hermes.'
-        : 'Could not reach a conversation composer. Open a chat and retry.'
-    )
-    invalidate()
   }
 
+  // Electron implements no window.prompt, so the title is an inline field.
   const createBoard = () => {
-    const title = window.prompt('New review board title', 'Untitled review')
+    const title = draftTitle.trim()
     if (title) newBoard.mutate(title)
   }
 
@@ -568,7 +587,27 @@ function ReviewPage() {
 
   const gateway = useValue(host.state.gateway)
 
-  return box('cr-page', [
+  // Keyboard shortcuts (ignored while a field has focus).
+  const onKey = (event) => {
+    const tag = event.target && event.target.tagName
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
+    const index = images.findIndex((im) => im.id === currentId)
+    if (event.key === 'ArrowDown' || event.key === ']') {
+      const next = images[Math.min(images.length - 1, index + 1)]
+      if (next) { setCurrentId(next.id); event.preventDefault() }
+    } else if (event.key === 'ArrowUp' || event.key === '[') {
+      const prev = images[Math.max(0, index - 1)]
+      if (prev) { setCurrentId(prev.id); event.preventDefault() }
+    } else if (event.key === 'f') {
+      setFitKey((k) => k + 1)
+    } else if (event.key === 'a' && currentId) {
+      approve.mutate({ decision: 'approved' })
+    } else if (event.key === 'r' && currentId) {
+      requestRevision()
+    }
+  }
+
+  return el('div', { className: 'cr-page', tabIndex: 0, onKeyDown: onKey }, [
     box('cr-toolbar', [
       el(Badge, { variant: 'muted', size: 'xs' }, 'Creative Review'),
       el(
@@ -582,7 +621,24 @@ function ReviewPage() {
           ? boards.map((b) => el('option', { value: b.id, key: b.id }, `${b.title} (${b.image_count})`))
           : [el('option', { value: '', key: 'empty' }, 'No boards yet')]
       ),
-      el(Button, { variant: 'secondary', size: 'sm', onClick: createBoard, children: 'New board' }),
+      newBoardOpen
+        ? [
+            el(Input, {
+              key: 'title',
+              className: 'cr-newboard',
+              autoFocus: true,
+              placeholder: 'Board title',
+              value: draftTitle,
+              onChange: (e) => setDraftTitle(e.target.value),
+              onKeyDown: (e) => {
+                if (e.key === 'Enter') createBoard()
+                else if (e.key === 'Escape') setNewBoardOpen(false)
+              }
+            }),
+            el(Button, { key: 'create', variant: 'default', size: 'sm', onClick: createBoard, disabled: !draftTitle.trim(), children: 'Create' }),
+            el(Button, { key: 'cancel', variant: 'ghost', size: 'sm', onClick: () => setNewBoardOpen(false), children: 'Cancel' })
+          ]
+        : el(Button, { variant: 'secondary', size: 'sm', onClick: () => setNewBoardOpen(true), children: 'New board' }),
       el(Button, {
         variant: 'ghost',
         size: 'sm',
@@ -595,11 +651,20 @@ function ReviewPage() {
     gateway !== 'open'
       ? el(ErrorState, { title: 'Gateway offline', description: 'Creative Review needs the running gateway for its local backend.' })
       : !board
-        ? box('cr-body-single', boardsQuery.isLoading ? jsx(GlyphSpinner, { ariaLabel: 'Loading' }) : el(EmptyState, {
-            title: 'No review board yet',
-            description: 'Ask Hermes to generate an image, then it will open a board here — or create one.',
-            action: el(Button, { onClick: createBoard, children: 'New board' })
-          }))
+        ? box('cr-body-single', [
+            boardsQuery.error
+              ? el(ErrorState, {
+                  title: 'Backend unavailable',
+                  description: 'The Creative Review backend is not answering. Enable the plugin (hermes plugins enable creative-review) and restart the gateway.'
+                })
+              : boardsQuery.isLoading
+                ? jsx(GlyphSpinner, { ariaLabel: 'Loading' })
+                : el(EmptyState, {
+                    title: 'No review board yet',
+                    description: 'Ask Hermes to generate an image, then it will open a board here — or create one with the field above.'
+                  }),
+            el(Button, { variant: 'secondary', size: 'sm', onClick: () => setNewBoardOpen(true), children: 'New board' })
+          ])
         : box('cr-body', [
             box('cr-col cr-col-side', [
               box('cr-section', [
@@ -616,10 +681,10 @@ function ReviewPage() {
                 image: current,
                 allowAnnotate: true,
                 onAddMarker: (x, y) => addMarker.mutate({ x, y }),
-                fitKey: currentId || ''
+                fitKey
               }),
               box('cr-actions', [
-                el(Button, { variant: 'primary', size: 'sm', onClick: requestRevision, disabled: !currentId, children: 'Request Revision' }),
+                el(Button, { variant: 'default', size: 'sm', onClick: requestRevision, disabled: !currentId || revisionBusy, loading: revisionBusy, children: 'Request Revision' }),
                 el(Button, { variant: 'secondary', size: 'sm', onClick: () => approve.mutate({ decision: 'approved' }), disabled: !currentId, children: 'Approve' }),
                 el(Button, { variant: 'ghost', size: 'sm', onClick: () => approve.mutate({ decision: 'rejected' }), disabled: !currentId, children: 'Reject' }),
                 el(Button, { variant: 'ghost', size: 'sm', onClick: () => doExport.mutate('json'), disabled: !boardId, children: 'Export JSON' }),
@@ -688,6 +753,8 @@ const CSS = `
 .cr-page{display:flex;flex-direction:column;height:100%;min-height:0;font-family:var(--font-sans,sans-serif);color:var(--ui-text-primary);font-size:12.5px}
 .cr-toolbar{display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--ui-stroke-secondary);flex-wrap:wrap}
 .cr-toolbar .cr-select{max-width:280px}
+.cr-newboard{width:180px}
+.cr-page:focus{outline:none}
 .cr-select{appearance:none;height:26px;padding:0 8px;border-radius:6px;border:1px solid var(--ui-stroke-secondary);background:var(--ui-bg-control,var(--background));color:var(--ui-text-primary);font:inherit}
 .cr-status{margin-left:auto;color:var(--ui-text-secondary);font-size:11.5px;max-width:44%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .cr-body{display:grid;grid-template-columns:200px minmax(0,1fr) 300px;gap:0;flex:1;min-height:0}
@@ -701,7 +768,9 @@ const CSS = `
 .cr-stage{position:relative;overflow:hidden;flex:1;min-height:280px;border:1px solid var(--ui-stroke-secondary);border-radius:10px;background:var(--ui-bg-editor,transparent);cursor:crosshair}
 .cr-stage-empty{display:grid;place-items:center;cursor:default}
 .cr-stage-inner{position:absolute;inset:0;transform-origin:0 0;will-change:transform}
-.cr-image{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;user-select:none}
+.cr-frame{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;min-width:0;min-height:0}
+.cr-canvas{position:relative;display:flex;max-width:100%;max-height:100%;min-width:0;min-height:0}
+.cr-image{display:block;max-width:100%;max-height:100%;width:auto;height:auto;user-select:none}
 .cr-image-annotate{cursor:crosshair}
 .cr-image-placeholder{position:absolute;inset:0;display:grid;place-items:center;padding:16px;text-align:center}
 .cr-markers{position:absolute;inset:0;pointer-events:none}

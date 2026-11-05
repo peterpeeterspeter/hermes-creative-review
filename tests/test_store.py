@@ -92,6 +92,37 @@ class StoreTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             store.add_image("board_missing", str(self.img))
 
+    def test_foreign_parent_is_rejected(self):
+        other = store.create_board("Other")["id"]
+        foreign = store.add_image(other, str(self.img), role="generated")
+        with self.assertRaises(ValueError):
+            store.add_image(self.board_id, str(self.img), parent_id=foreign["id"])
+
+    def test_reapproving_demotes_the_earlier_pick(self):
+        v1 = store.add_image(self.board_id, str(self.img), role="generated", label="v1")
+        v2 = store.add_image(self.board_id, str(self.img), role="generated", label="v2")
+        store.set_approval(self.board_id, v1["id"], "approved")
+        store.set_approval(self.board_id, v2["id"], "approved")
+        roles = {im["id"]: im["role"] for im in store.get_board(self.board_id)["images"]}
+        self.assertEqual(roles[v2["id"]], "approved")
+        self.assertNotEqual(roles[v1["id"]], "approved")
+
+    def test_rejection_clears_any_approved_role(self):
+        v1 = store.add_image(self.board_id, str(self.img), role="generated")
+        store.set_approval(self.board_id, v1["id"], "approved")
+        store.set_approval(self.board_id, v1["id"], "rejected")
+        board = store.get_board(self.board_id)
+        self.assertEqual(board["status"], "rejected")
+        self.assertNotEqual(
+            next(im for im in board["images"] if im["id"] == v1["id"])["role"], "approved")
+
+    def test_read_image_bytes_returns_raw_bytes(self):
+        img = store.add_image(self.board_id, str(self.img))
+        data = store.read_image_bytes(img["id"])
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["mime"], "image/png")
+        self.assertEqual(data["bytes"][:8], b"\x89PNG\r\n\x1a\n")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -16,12 +16,16 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Optional
 
 PLUGIN_ID = "creative-review"
+
+# Largest image we will read into memory (also the data-URL ceiling).
+MAX_IMAGE_BYTES = 40 * 1024 * 1024
 
 # Roles an image row can carry.
 ROLE_REFERENCE = "reference"
@@ -40,6 +44,9 @@ _MIME = {
     ".bmp": "image/bmp",
     ".avif": "image/avif",
 }
+
+# One connection per (thread, database path) — see `_connect`.
+_local = threading.local()
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS boards (
@@ -103,12 +110,29 @@ def _new_id(prefix: str) -> str:
 
 
 def _connect() -> sqlite3.Connection:
-    """Open the plugin's SQLite DB and make sure the schema exists."""
-    from plugins.plugin_storage import plugin_db
+    """Open this thread's connection to the active profile's DB, schema once.
 
-    conn = plugin_db(PLUGIN_ID)
-    conn.row_factory = sqlite3.Row
-    conn.executescript(_SCHEMA)
+    One connection per (thread, database path): threads must not share a SQLite
+    connection while the FastAPI thread pool writes concurrently, and keying on
+    the resolved path (not just the plugin) keeps a multiplexed gateway honest —
+    a profile switch opens the new profile's file instead of reusing the old one.
+    """
+    from plugins.plugin_storage import plugin_data_dir, plugin_db
+
+    path = str(plugin_data_dir(PLUGIN_ID) / "data.db")
+    cache = getattr(_local, "conns", None)
+    if cache is None:
+        cache = {}
+        _local.conns = cache
+    conn = cache.get(path)
+    if conn is None:
+        conn = plugin_db(PLUGIN_ID)
+        conn.row_factory = sqlite3.Row
+        # Wait rather than raise when the agent half and the backend half write at
+        # the same moment (separate processes, one WAL database).
+        conn.execute("PRAGMA busy_timeout = 5000")
+        conn.executescript(_SCHEMA)
+        cache[path] = conn
     return conn
 
 
@@ -221,6 +245,12 @@ def add_image(board_id: str, path: str, role: str = ROLE_GENERATED,
         raise ValueError(f"role must be one of {sorted(VALID_ROLES)}")
     if get_board(board_id) is None:
         raise ValueError(f"unknown board: {board_id}")
+    if parent_id:
+        parent = get_image(parent_id)
+        if parent is None:
+            raise ValueError(f"unknown parent image: {parent_id}")
+        if parent["board_id"] != board_id:
+            raise ValueError(f"parent image {parent_id} belongs to another board")
     info = describe_path(path)
     if not info["exists"]:
         raise FileNotFoundError(f"image file not found: {info['path']}")
@@ -375,9 +405,14 @@ def set_approval(board_id: str, image_id: str, decision: str) -> dict[str, Any]:
         conn.execute("UPDATE boards SET status = ?, updated_at = ? WHERE id = ?",
                      ("approved" if decision == "approved" else "rejected",
                       _now(), board_id))
+        # Exactly one image on a board is 'approved': promote the chosen one and
+        # demote any earlier pick, so re-approving a different version never
+        # leaves two rows claiming to be the final image.
+        conn.execute("UPDATE images SET role = ? WHERE board_id = ? AND role = ?",
+                     (ROLE_GENERATED, board_id, ROLE_APPROVED))
         if decision == "approved":
-            conn.execute("UPDATE images SET role = ? WHERE id = ? AND role != ?",
-                         (ROLE_APPROVED, image_id, ROLE_APPROVED))
+            conn.execute("UPDATE images SET role = ? WHERE id = ?",
+                         (ROLE_APPROVED, image_id))
     return _row_to_dict(conn.execute(
         "SELECT * FROM approvals WHERE board_id = ?", (board_id,)).fetchone())  # type: ignore[return-value]
 
@@ -391,9 +426,8 @@ def get_approval(board_id: str) -> Optional[dict[str, Any]]:
 # --------------------------------------------------------------------------- #
 # Image bytes (on-demand, local only)
 # --------------------------------------------------------------------------- #
-def read_image_data_url(image_id: str, max_bytes: int = 40 * 1024 * 1024) -> dict[str, Any]:
-    import base64
-
+def read_image_bytes(image_id: str, max_bytes: int = MAX_IMAGE_BYTES) -> dict[str, Any]:
+    """Read one registered image's bytes from disk. Local only, never network."""
     image = get_image(image_id)
     if image is None:
         return {"ok": False, "error": "unknown image"}
@@ -409,6 +443,15 @@ def read_image_data_url(image_id: str, max_bytes: int = 40 * 1024 * 1024) -> dic
     if mime is None:
         return {"ok": False, "error": "unsupported",
                 "message": f"unsupported extension {path.suffix}"}
-    b64 = base64.b64encode(path.read_bytes()).decode("ascii")
-    return {"ok": True, "mime": mime, "size": size,
-            "data_url": f"data:{mime};base64,{b64}"}
+    return {"ok": True, "mime": mime, "size": size, "bytes": path.read_bytes()}
+
+
+def read_image_data_url(image_id: str, max_bytes: int = MAX_IMAGE_BYTES) -> dict[str, Any]:
+    import base64
+
+    data = read_image_bytes(image_id, max_bytes=max_bytes)
+    if not data.get("ok"):
+        return data
+    b64 = base64.b64encode(data["bytes"]).decode("ascii")
+    return {"ok": True, "mime": data["mime"], "size": data["size"],
+            "data_url": f"data:{data['mime']};base64,{b64}"}
