@@ -1,0 +1,18 @@
+name: creative-review
+version: 1.0.0
+manifest_version: 2
+api_version: 1
+description: "Give your AI agent an art director's desk — visually review AI-generated images, drop numbered point annotations, hand a structured revision brief straight back into the Hermes conversation, compare versions, and approve the final image. Local-first: images never leave your machine."
+author: Peter
+license: MIT
+homepage: https://github.com/petervdv/hermes-creative-review
+tags: [desktop, image, review, annotation, design, art-direction]
+requires_hermes: ">=0.22.0"
+provides_tools:
+  - creative_review_create_board
+  - creative_review_list_boards
+  - creative_review_add_image
+  - creative_review_get_board
+  - creative_review_revision_brief
+  - creative_review_approve
+  - creative_review_export
