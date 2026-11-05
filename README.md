@@ -2,6 +2,8 @@
 
 **Give your AI agent an art director's desk.**
 
+![Creative Review](docs/banner.png)
+
 Creative Review is a Hermes plugin (Desktop pane + agent tools + local backend)
 that turns "that's not quite right, make the buckle gold and drop the logo" into
 a precise, structured revision the agent can act on — and then lets the user
@@ -73,6 +75,35 @@ desktop/plugin.js      Desktop pane: compare, zoom/pan, annotate, revise, approv
 skills/creative-review/ bundled agent workflow skill
 tests/                 unit tests for store / brief / export
 ```
+
+## Status & verification
+
+Everything below was run against the shipped plugin, not a mock:
+
+| Check | Command | Result |
+|---|---|---|
+| Catalog admission | `hermes plugins validate . --install-deps` | ✅ all green (incl. `desktop surface`, `security scan`, `no core override`) |
+| Runtime registration | `hermes plugins doctor .` | ✅ 7 tools, registration passed |
+| Unit + tool contract | `python -m unittest discover -s tests` | ✅ 25 passed |
+| Backend routes (real ASGI app) | `python tests/integration_backend.py` | ✅ 21 passed |
+| Desktop registration | `node tests/desktop_harness.mjs` | ✅ 15 passed |
+
+`./scripts/run_tests.sh` runs all five in one go.
+
+Also exercised end to end in a **real agent conversation**: a one-shot Hermes turn
+created a board and registered two images through the live tools
+(`hermes chat --cli`), and the backend test read that board back from a fresh
+process — persistence across processes, not just within one.
+
+### Not yet verified
+
+- **The visual Desktop pane.** The Electron half loads only after the app
+  **Rescans** and the user switches the plugin on under **Capabilities →
+  Plugins** (both in-app actions). Until then the pane cannot be scripted or
+  screenshotted from outside the app; the registration and rendering of every
+  contribution is covered by `tests/desktop_harness.mjs` instead.
+- **Screenshots / demo recording.** Pending the above; the shot list is in
+  [docs/DEMO.md](docs/DEMO.md).
 
 ## Privacy & disclosure
 
